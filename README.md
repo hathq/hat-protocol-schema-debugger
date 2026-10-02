@@ -1,12 +1,27 @@
 # hat-protocol-schema-debugger
 
-Debug-only Hathq tool that inventories ecosystem `://` identifiers, classifies
-them as protocol, schema, vocabulary, ledger, transport or resource references,
-applies that projection to `zixcel-graph`, and exports a bounded JSON view for
-Hatter Console.
+Find protocol and schema references in a selected source area and inspect how they relate.
 
-The tool does not make a URI authoritative. It exposes the current state so
-release work can see where protocol, schema and resource identifiers are mixed.
+## What you can do
+
+- Classify identifiers and flag ambiguous contract paths.
+- Export a bounded diagnostic graph for review.
+
+## Current scope
+
+This is a debugging projection. Its labels and graph do not create authoritative product state.
+
+Package distribution is not activated by this documentation. Use the checked-in source and the declared dependency versions; published availability must be verified separately.
+
+## Getting started
+
+Install Rust 1.97 or newer and make the declared dependencies available. Use the configured private registry when a dependency is not distributed publicly. Run from this repository:
+
+```sh
+cargo test --locked
+```
+
+## Examples and interface details
 
 ## Usage
 
@@ -28,24 +43,10 @@ cargo run -- scan \
 The generated JSON is intentionally UI-shaped. Hatter Console reads it as a
 debug projection and never treats it as canonical product state.
 
-## Classification rule
+## Documentation and source
 
-- `protocol`: a communication, operation or exchange contract.
-- `schema`: one message, record, result or payload shape.
-- `vocabulary`: a meaning term, catalog or lexical item.
-- `ledger`: a provenance or history ledger.
-- `transport`: an external transport such as WebSocket or Cargo sparse HTTP.
-- `resource`: repository, catalog, workspace, secret, evidence or other target.
+[Interface reference](docs/interface-reference.md)
 
-Compound path segments containing `-` are reported as warnings only for
-`hathq://` contract paths, because Hatter's shared contract policy expects each
-owned segment to carry one machine-readable concept. Provider and resource
-schemes remain opaque and are not rewritten by Hatter.
+[Usage guide](docs/getting-started.md)
 
-The 0.10.0 HatSpec contract namespace is `hathq://hat/...`; the first path
-segment identifies `vocabulary`, `schema`, or `protocol`. Hatter-local
-`hathq://hatter/...` identifiers are reported as `hatter-local-namespace` and
-must not be published as shared contracts. A possible future `hat://hathq/...`
-namespace is a breaking migration and is intentionally not treated as an
-alias. Generated reports are excluded from subsequent scans to keep the
-projection deterministic.
+[Implementation and public interfaces](src) · [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) · [License](LICENSE) · [Attribution notices](NOTICE)
