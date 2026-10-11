@@ -6,6 +6,60 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use zixcel_graph::{Edge, Graph, GraphSpace, Node, PropertyValue};
 
+/// Operational source-selection policy loaded from an external JSON file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanPolicy {
+    schema: String,
+    excluded_directories: Vec<String>,
+    supported_extensions: Vec<String>,
+}
+
+impl ScanPolicy {
+    /// Loads an explicit policy without falling back to built-in selection lists.
+    ///
+    /// # Errors
+    /// Returns an error for missing, non-regular, or invalid policy files.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        if !fs::symlink_metadata(path)
+            .map_err(|_| "scan policy unavailable")?
+            .is_file()
+        {
+            return Err("scan policy must be a regular file".to_owned());
+        }
+        let policy: Self =
+            serde_json::from_slice(&fs::read(path).map_err(|_| "scan policy unavailable")?)
+                .map_err(|_| "invalid scan policy")?;
+        if policy.schema != "hat/source-scan-policy/1"
+            || policy.excluded_directories.is_empty()
+            || policy.supported_extensions.is_empty()
+            || policy
+                .excluded_directories
+                .iter()
+                .chain(&policy.supported_extensions)
+                .any(|value| {
+                    value.is_empty()
+                        || value == "."
+                        || value == ".."
+                        || value.contains('/')
+                        || value.contains('\\')
+                })
+        {
+            return Err("invalid scan policy".to_owned());
+        }
+        Ok(policy)
+    }
+}
+
+fn default_scan_policy() -> Result<ScanPolicy, String> {
+    let path = std::env::var_os("PROTOCOL_SCHEMA_SCAN_POLICY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/scan-policy.json")
+        });
+    ScanPolicy::load(&path)
+}
+
 pub const PROJECTION_SCHEMA: &str = "hat://hathq/schema/debug/protocol/schema/graph/v1";
 const GRAPH_SPACE: &str = "hathq.protocol.schema.debug";
 
@@ -113,6 +167,21 @@ pub fn scan_ecosystem(
     root: &Path,
     graph_db: Option<&Path>,
 ) -> Result<ProtocolSchemaProjection, String> {
+    let policy = default_scan_policy()?;
+    scan_ecosystem_with_policy(root, graph_db, &policy)
+}
+
+/// Scans using an explicitly loaded operational policy.
+///
+/// # Errors
+/// Returns an error when source selection or graph projection fails.
+pub fn scan_ecosystem_with_policy(
+    root: &Path,
+    graph_db: Option<&Path>,
+    policy: &ScanPolicy,
+) -> Result<ProtocolSchemaProjection, String> {
+    // Validate and collect before opening any durable graph store.
+    let occurrences = grouped_occurrences(root, policy)?;
     let graph = match graph_db {
         Some(path) => Graph::create(path).map_err(|error| error.to_string())?,
         None => Graph::memory().map_err(|error| error.to_string())?,
@@ -137,7 +206,7 @@ pub fn scan_ecosystem(
         ],
     )?;
 
-    for (uri, items) in grouped_occurrences(root)? {
+    for (uri, items) in occurrences {
         let record = identifier_record(uri, &items);
         warnings.extend(record.warnings);
         apply_identifier_to_graph(
@@ -154,9 +223,12 @@ pub fn scan_ecosystem(
     Ok(finalize_projection(root, nodes, edges, warnings, revision))
 }
 
-fn grouped_occurrences(root: &Path) -> Result<BTreeMap<String, Vec<Occurrence>>, String> {
+fn grouped_occurrences(
+    root: &Path,
+    policy: &ScanPolicy,
+) -> Result<BTreeMap<String, Vec<Occurrence>>, String> {
     let mut grouped: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
-    for occurrence in collect_occurrences(root)? {
+    for occurrence in collect_occurrences_with_policy(root, policy)? {
         grouped
             .entry(occurrence.uri.clone())
             .or_default()
@@ -359,28 +431,52 @@ fn finalize_projection(
     projection
 }
 
+#[cfg(test)]
 fn collect_occurrences(root: &Path) -> Result<Vec<Occurrence>, String> {
+    collect_occurrences_with_policy(root, &default_scan_policy()?)
+}
+
+fn collect_occurrences_with_policy(
+    root: &Path,
+    policy: &ScanPolicy,
+) -> Result<Vec<Occurrence>, String> {
+    let physical = fs::canonicalize(root).map_err(|_| "scan root unavailable".to_string())?;
+    if fs::symlink_metadata(root)
+        .map_err(|_| "scan root unavailable".to_string())?
+        .file_type()
+        .is_symlink()
+        || physical.components().any(|part| {
+            matches!(part, std::path::Component::Normal(name) if skip_dir(&name.to_string_lossy(), policy))
+        })
+    {
+        return Err("scan root is excluded from source inspection".to_string());
+    }
     let mut output = Vec::new();
-    walk(root, root, &mut output)?;
+    walk(root, root, &mut output, policy)?;
     Ok(output)
 }
 
-fn walk(root: &Path, path: &Path, output: &mut Vec<Occurrence>) -> Result<(), String> {
+fn walk(
+    root: &Path,
+    path: &Path,
+    output: &mut Vec<Occurrence>,
+    policy: &ScanPolicy,
+) -> Result<(), String> {
     for entry in fs::read_dir(path).map_err(|error| format!("read {}: {error}", path.display()))? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if entry
-            .file_type()
-            .map_err(|error| error.to_string())?
-            .is_dir()
-        {
-            if skip_dir(&name) {
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if skip_dir(&name, policy) {
                 continue;
             }
-            walk(root, &path, output)?;
-        } else if supported_file(&path) {
+            walk(root, &path, output, policy)?;
+        } else if file_type.is_file() && supported_file(&path, policy) {
             let text = fs::read_to_string(&path).unwrap_or_default();
             let source_path = relative(root, &path);
             for (uri, context) in extract_uris(&text) {
@@ -395,28 +491,22 @@ fn walk(root: &Path, path: &Path, output: &mut Vec<Occurrence>) -> Result<(), St
     Ok(())
 }
 
-fn skip_dir(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | "target"
-            | "node_modules"
-            | ".nuxt"
-            | ".output"
-            | "dist"
-            | "build"
-            | ".cache"
-            | "coverage"
-            | "vendor"
-            | "generated"
-    )
+fn skip_dir(name: &str, policy: &ScanPolicy) -> bool {
+    policy
+        .excluded_directories
+        .iter()
+        .any(|excluded| excluded == name)
 }
 
-fn supported_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|value| value.to_str()),
-        Some("rs" | "json" | "md" | "ts" | "vue" | "toml" | "yaml" | "yml" | "mjs" | "js")
-    )
+fn supported_file(path: &Path, policy: &ScanPolicy) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            policy
+                .supported_extensions
+                .iter()
+                .any(|allowed| allowed == extension)
+        })
 }
 
 fn extract_uris(text: &str) -> Vec<(String, String)> {
@@ -751,16 +841,22 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let mut ecosystem_root: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut graph_db: Option<PathBuf> = None;
+    let mut policy_path: Option<PathBuf> = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--ecosystem-root" => ecosystem_root = args.next().map(PathBuf::from),
             "--output" => output = args.next().map(PathBuf::from),
             "--graph-db" => graph_db = args.next().map(PathBuf::from),
+            "--scan-policy" => policy_path = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
             _ => return Err(format!("unknown argument {flag}\n{}", usage())),
         }
     }
     let root = ecosystem_root.ok_or_else(usage)?;
-    let projection = scan_ecosystem(&root, graph_db.as_deref())?;
+    let policy = match policy_path {
+        Some(path) => ScanPolicy::load(&path)?,
+        None => default_scan_policy()?,
+    };
+    let projection = scan_ecosystem_with_policy(&root, graph_db.as_deref(), &policy)?;
     if let Some(path) = output {
         write_projection(&path, &projection)?;
     } else {
@@ -773,12 +869,96 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: hat-protocol-schema-debugger scan --ecosystem-root <path> [--output <path>] [--graph-db <path>]".to_owned()
+    "usage: hat-protocol-schema-debugger scan --ecosystem-root <path> [--output <path>] [--graph-db <path>] [--scan-policy <path>]".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_selection_uses_external_policy_and_rejects_missing_or_invalid_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let policy_path = temp.path().join("policy.json");
+        assert!(ScanPolicy::load(&policy_path).is_err());
+        fs::write(&policy_path, r#"{"schema":"hat/source-scan-policy/1","excluded_directories":[],"supported_extensions":["custom"]}"#)
+            .expect("invalid policy");
+        assert!(ScanPolicy::load(&policy_path).is_err());
+        fs::write(&policy_path, r#"{"schema":"hat/source-scan-policy/1","excluded_directories":["private-fixture"],"supported_extensions":["custom"]}"#)
+            .expect("policy");
+        let policy = ScanPolicy::load(&policy_path).expect("external policy");
+        let private = temp.path().join("private-fixture");
+        fs::create_dir(&private).expect("private directory");
+        fs::write(
+            private.join("hidden.custom"),
+            "private://retired-project/v1",
+        )
+        .expect("hidden");
+        fs::write(
+            temp.path().join("selected.custom"),
+            "hat://hathq/schema/source/v1",
+        )
+        .expect("source");
+        fs::write(
+            temp.path().join("unselected.json"),
+            "private://unselected/v1",
+        )
+        .expect("other extension");
+        let items = collect_occurrences_with_policy(temp.path(), &policy).expect("scan");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].uri, "hat://hathq/schema/source/v1");
+        assert!(collect_occurrences_with_policy(&private, &policy).is_err());
+    }
+
+    #[test]
+    fn excludes_private_inputs_and_rejects_excluded_roots_before_store_creation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for name in [
+            "migration-input",
+            "state",
+            ".state",
+            ".artifacts",
+            "registration",
+        ] {
+            let directory = temp.path().join(name);
+            fs::create_dir_all(&directory).expect("directory");
+            fs::write(
+                directory.join("input.json"),
+                r#"{"id":"private://retired-project/v1"}"#,
+            )
+            .expect("fixture");
+            let database = temp.path().join("must-not-create.redb");
+            assert!(scan_ecosystem(&directory, Some(&database)).is_err());
+            assert!(!database.exists());
+        }
+        fs::write(
+            temp.path().join("source.json"),
+            r#"{"id":"hat://hathq/schema/source/v1"}"#,
+        )
+        .expect("source");
+        let occurrences = collect_occurrences(temp.path()).expect("source scan");
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].uri, "hat://hathq/schema/source/v1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cannot_follow_links_into_private_inputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let private = temp.path().join("migration-input");
+        fs::create_dir(&private).expect("directory");
+        fs::write(
+            private.join("input.json"),
+            r#"{"id":"private://retired-project/v1"}"#,
+        )
+        .expect("fixture");
+        std::os::unix::fs::symlink(private.join("input.json"), temp.path().join("linked.json"))
+            .expect("file link");
+        std::os::unix::fs::symlink(&private, temp.path().join("linked-directory"))
+            .expect("directory link");
+        assert!(collect_occurrences(temp.path()).expect("scan").is_empty());
+        assert!(collect_occurrences(&temp.path().join("linked-directory")).is_err());
+    }
 
     #[test]
     fn extracts_and_classifies_schema_protocol_and_vocabulary() {

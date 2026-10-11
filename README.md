@@ -40,6 +40,14 @@ cargo run -- scan \
   --output generated/protocol-schema-graph.json
 ```
 
+Source selection is configured in `config/scan-policy.json`. Use `--scan-policy`
+or `PROTOCOL_SCHEMA_SCAN_POLICY` to select another policy file. Missing or
+invalid policies stop scanning before a durable graph is opened.
+
+The shipped policy excludes migration inputs, local state, registration data, generated
+artifacts, and symbolic links. An excluded directory cannot be used as a scan
+root. These private inputs are never part of the diagnostic source graph.
+
 The generated JSON is intentionally UI-shaped. Hatter Console reads it as a
 debug projection and never treats it as canonical product state.
 

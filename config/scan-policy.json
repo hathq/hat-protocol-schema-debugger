@@ -1,0 +1,33 @@
+{
+  "schema": "hat/source-scan-policy/1",
+  "excluded_directories": [
+    ".git",
+    "target",
+    "node_modules",
+    ".nuxt",
+    ".output",
+    "dist",
+    "build",
+    ".cache",
+    "coverage",
+    "vendor",
+    "generated",
+    "migration-input",
+    "state",
+    ".state",
+    ".artifacts",
+    "registration"
+  ],
+  "supported_extensions": [
+    "rs",
+    "json",
+    "md",
+    "ts",
+    "vue",
+    "toml",
+    "yaml",
+    "yml",
+    "mjs",
+    "js"
+  ]
+}
